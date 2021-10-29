@@ -19,9 +19,12 @@ import (
 var (
 	BootstrapPeerThreshold = build.BootstrapPeerThreshold
 
-	RecentSyncBufferSize = 10
-	MaxSyncWorkers       = 5
-	SyncWorkerHistory    = 3
+	// RecentSyncBufferSize = 10
+	// MaxSyncWorkers       = 5
+	// SyncWorkerHistory    = 3
+	RecentSyncBufferSize = 100
+	MaxSyncWorkers       = 30
+	SyncWorkerHistory    = 20
 
 	InitialSyncTimeThreshold = 15 * time.Minute
 

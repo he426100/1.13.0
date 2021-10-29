@@ -421,7 +421,7 @@ func (st *Local) Reserve(ctx context.Context, sid storage.SectorRef, ft storifac
 	return done, nil
 }
 
-func (st *Local) AcquireSector(ctx context.Context, sid storage.SectorRef, existing storiface.SectorFileType, allocate storiface.SectorFileType, pathType storiface.PathType, op storiface.AcquireMode) (storiface.SectorPaths, storiface.SectorPaths, error) {
+func (st *Local) acquireSector(ctx context.Context, sid storage.SectorRef, existing storiface.SectorFileType, allocate storiface.SectorFileType, pathType storiface.PathType, op storiface.AcquireMode) (storiface.SectorPaths, storiface.SectorPaths, error) {
 	if existing|allocate != existing^allocate {
 		return storiface.SectorPaths{}, storiface.SectorPaths{}, xerrors.New("can't both find and allocate a sector")
 	}
@@ -442,7 +442,10 @@ func (st *Local) AcquireSector(ctx context.Context, sid storage.SectorRef, exist
 			continue
 		}
 
-		si, err := st.index.StorageFindSector(ctx, sid.ID, fileType, ssize, false)
+		// si, err := st.index.StorageFindSector(ctx, sid.ID, fileType, ssize, false)
+
+		si, err := st.CheckDeclareSector(ctx, sid.ID, fileType, ssize, pathType)
+
 		if err != nil {
 			log.Warnf("finding existing sector %d(t:%d) failed: %+v", sid, fileType, err)
 			continue
@@ -515,6 +518,62 @@ func (st *Local) AcquireSector(ctx context.Context, sid storage.SectorRef, exist
 	}
 
 	return out, storageIDs, nil
+}
+
+func (st *Local) AcquireSector(ctx context.Context, sid storage.SectorRef, existing storiface.SectorFileType, allocate storiface.SectorFileType, pathType storiface.PathType, op storiface.AcquireMode) (storiface.SectorPaths, storiface.SectorPaths, error) {
+	if allocate != storiface.FTNone || pathType != storiface.PathStorage {
+		return st.acquireSector(ctx, sid, existing, allocate, pathType, op)
+	}
+
+	checkDeclareSectorQiniu := func(id ID, p *path, sid abi.SectorID, fileType storiface.SectorFileType) {
+		spath := p.sectorPath(sid, fileType)
+		if fileType == storiface.FTCache {
+			spath = filepath.Join(spath, "p_aux")
+		}
+		_, err := os.Stat(spath)
+		if err != nil {
+			return
+		}
+		err = st.index.StorageDeclareSector(ctx, id, sid, fileType, true)
+		log.Infof("checkDeclareSectorQiniu %s, %s, %s, %v", id, sid, fileType, err)
+	}
+
+	checkUnsealed := existing&storiface.FTUnsealed != 0
+	checkSealed := existing&storiface.FTSealed != 0
+	checkCache := existing&storiface.FTCache != 0
+
+	out, storageIDs, err := st.acquireSector(ctx, sid, existing, allocate, pathType, op)
+	if err != nil {
+		return out, storageIDs, err
+	}
+	if !((checkUnsealed && out.Unsealed == "") ||
+		(checkSealed && out.Sealed == "") ||
+		(checkCache && out.Cache == "")) {
+		return out, storageIDs, err
+	}
+
+	for id, p := range st.paths {
+		if p.local == "" {
+			continue
+		}
+
+		si, err := st.index.StorageInfo(ctx, id)
+		if err != nil || !si.CanStore {
+			continue
+		}
+
+		if checkUnsealed && out.Unsealed == "" {
+			checkDeclareSectorQiniu(id, p, sid.ID, storiface.FTUnsealed)
+		}
+		if checkSealed && out.Sealed == "" {
+			checkDeclareSectorQiniu(id, p, sid.ID, storiface.FTSealed)
+		}
+		if checkCache && out.Cache == "" {
+			checkDeclareSectorQiniu(id, p, sid.ID, storiface.FTCache)
+		}
+	}
+
+	return st.acquireSector(ctx, sid, existing, allocate, pathType, op)
 }
 
 func (st *Local) Local(ctx context.Context) ([]StoragePath, error) {
@@ -701,3 +760,29 @@ func (st *Local) FsStat(ctx context.Context, id ID) (fsutil.FsStat, error) {
 }
 
 var _ Store = &Local{}
+
+// 先判断下，再 返回 st.index.StorageFindSector(ctx, sid, fileType, ssize, false)
+//寻找这个sector的信息：比如在哪个目录。fasle是本地的意思。不远程拉取
+func (st *Local) CheckDeclareSector(ctx context.Context, sid abi.SectorID, fileType storiface.SectorFileType, ssize abi.SectorSize, pathType storiface.PathType) ([]SectorStorageInfo, error) {
+	si0, err := st.index.StorageFindSector(ctx, sid, fileType, ssize, false)
+	if len(si0) > 0 || err != nil {
+		return si0, err
+	}
+	if pathType == storiface.PathStorage {
+		for id, path := range st.paths {
+			if sstInfo, err := st.index.StorageInfo(ctx, id); err == nil {
+				if sstInfo.CanStore {
+					p := filepath.Join(path.local, fileType.String(), storiface.SectorName(sid))
+					_, err := os.Stat(p)
+					if os.IsNotExist(err) || err != nil {
+						continue
+					}
+					if err := st.index.StorageDeclareSector(ctx, id, sid, fileType, sstInfo.CanStore); err != nil {
+						continue
+					}
+				}
+			}
+		}
+	}
+	return st.index.StorageFindSector(ctx, sid, fileType, ssize, false)
+}
